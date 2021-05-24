@@ -11,7 +11,7 @@ clean:
 # test:
 # 	@$(TESTPATH)
 
-$(TARGET): config.o match.o main.o
+$(TARGET): main.o
 	$(CC) -o $(TARGET) $^
 
 main.o: main.c
