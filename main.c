@@ -26,9 +26,23 @@
 #define RAND_MAX	64000 - RAND_MIN
 #define RAND_MIN	1024
 
-#define MAX_SERVERS			3
-#define SOCKET_BACKLOG			3
+#define MAX_SERVERS			1
+#define MAX_CLIENTS			1
+#define SOCKET_BACKLOG			MAX_SERVERS
 #define CLIENT_SOCKET_MAX_BACKLOG	1
+
+#define HTML_MESSAGE_END	"\r\n\r\n"
+#define BUFF_LEN 		100
+
+struct load_balancer_env
+{
+	int server_sockfd;
+	int client_sockfd;
+	int servers_conn_sockfd[MAX_SERVERS];
+	int client_conn_sockfd;
+	int client_connection_cnt;
+};
+
 
 int write_port_to_file(uint16_t port, char *path)
 {
@@ -75,52 +89,85 @@ int load_balancer_port_init(char *path, int *sockfd)
 	return 0;
 }
 
+int sock_await_accept_conn(int sockfd, int conn_cnt, int *connfd)
+{
+	struct sockaddr_in connaddr = {0};
+	socklen_t addrlen = {0};
+	
+	for (int i = 0; i < conn_cnt; i++) {
+		dbg("waiting for connection ... ");
+		connfd[i] = accept(sockfd, (struct sockaddr *)&connaddr, &addrlen);
+		if (connfd[i] < 0) {
+			dbg("%s\n", strerror(errno));
+			return ERROR;
+		}
+		dbg("accepted connection!\n");
+	}
+
+	return 0;
+}
+
 int main()
 {
+	struct load_balancer_env env = {0};
 	srand(time(0));
 
-	// int status;
-	int server_sockfd;
+	if (load_balancer_port_init(SERVER_PORT_PATH, &env.server_sockfd) < 0) {
+		dbg("%s\n", strerror(errno));
+		return ERROR;
+	}
 
-	load_balancer_port_init(SERVER_PORT_PATH, &server_sockfd);
+	if (load_balancer_port_init(CLIENT_PORT_PATH, &env.client_sockfd) < 0) {
+		dbg("%s\n", strerror(errno));
+		return ERROR;
+	}
 
-	// int client_sockfd = socket(AF_INET, SOCK_STREAM, 0);
-	// if (client_sockfd < 0) {
-	// 	strerror(errno);
-	// 	return errno;
-	// }
+	if (sock_await_accept_conn(env.server_sockfd, MAX_SERVERS, env.servers_conn_sockfd) < 0) {
+		dbg("%s\n", strerror(errno));
+		return ERROR;
+	}
 
-	// struct sockaddr_in client_addr;
-	// client_addr.sin_family = AF_INET;
-	// client_addr.sin_port = htons(TEMP_CLIENT_PORT);
-	// client_addr.sin_addr.s_addr = htonl(INADDR_ANY);
-
-	// status = bind(client_sockfd, (struct sockaddr *)&client_addr, sizeof(client_addr));
-	// if (status < 0) {
-	// 	strerror(errno);
-	// 	return errno;
-	// }
-
-	// status = listen(client_sockfd, CLIENT_SOCKET_MAX_BACKLOG);
-	// if (status < 0) {
-	// 	strerror(errno);
-	// 	return errno;
-	// }
-
-	int connfd[MAX_SERVERS] = {0};
-	socklen_t addrlen[MAX_SERVERS] = {0};
-	struct sockaddr_in conn_addr[MAX_SERVERS];
-	for (int i = 0; i < MAX_SERVERS; i++) {
-		printf("waiting for connection ... ");
-
-		connfd[i] = accept(server_sockfd, (struct sockaddr *)&conn_addr[i], &addrlen[i]);
-		if (connfd[i] < 0) {
-			printf("err\n");
-			strerror(errno);
-			return errno;
+	while (1) {
+		if (sock_await_accept_conn(env.client_sockfd, MAX_CLIENTS, &env.client_conn_sockfd) < 0) {
+			dbg("%s\n", strerror(errno));
+			return ERROR;
 		}
 
-		printf("accepted connection!\n");
+		char buff[BUFF_LEN] = {0};
+
+		while(1)
+		{
+			int size_recv =  recv(env.client_conn_sockfd , buff , BUFF_LEN , 0);
+			if (size_recv < 0) {
+				dbg("%s\n", strerror(errno));
+				return ERROR;
+			}
+			
+			int size_to_send = size_recv;
+			char *p_start_of_end_of_http_msg = strstr(buff, HTML_MESSAGE_END);
+			if (p_start_of_end_of_http_msg) {
+				char *p_last_http_char = p_start_of_end_of_http_msg + strlen(HTML_MESSAGE_END);
+				size_to_send = p_last_http_char - buff;
+			}
+			
+			while(size_to_send) {
+				int size_sent = send(env.servers_conn_sockfd[env.client_connection_cnt % MAX_SERVERS], buff, size_to_send, 0);
+				if (size_sent < 0) {
+					dbg("%s\n", strerror(errno));
+					return ERROR;
+				} else {
+					size_to_send -= size_sent;
+				}
+			}
+
+			if (p_start_of_end_of_http_msg) {
+				break;
+			}
+		}
+
+		env.client_connection_cnt++;
+
+		break;
 	}
 
 	exit(2);
