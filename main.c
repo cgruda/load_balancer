@@ -10,10 +10,11 @@
 #include <stdio.h>
 
 #include <string.h>
-
+#include <stdbool.h>
 #include <time.h>
 
-#define ERROR			-1
+#define SUCCESS			0
+#define FAILURE			-1
 #define dbg			printf
 #define SERVER_PORT_PATH	"server_port"
 #define CLIENT_PORT_PATH	"http_port"
@@ -31,8 +32,11 @@
 #define SOCKET_BACKLOG			MAX_SERVERS
 #define CLIENT_SOCKET_MAX_BACKLOG	1
 
-#define HTML_MESSAGE_END	"\r\n\r\n"
+#define HTTP_MSG_END		"\r\n\r\n"
+#define HTTP_MSG_END_LEN	4
 #define BUFF_LEN 		100
+
+#define BUFF_ALLOC_CHUNK		256
 
 struct load_balancer_env
 {
@@ -43,12 +47,11 @@ struct load_balancer_env
 	int client_connection_cnt;
 };
 
-
 int write_port_to_file(uint16_t port, char *path)
 {
 	FILE *fp = fopen(path, "w");
 	if (!fp) {
-		return ERROR;
+		return FAILURE;
 	}
 	fprintf(fp, "%d", port);
 	fclose(fp);
@@ -61,7 +64,7 @@ int load_balancer_port_init(char *path, int *sockfd)
 
 	*sockfd = socket(AF_INET, SOCK_STREAM, 0);
 	if (*sockfd < 0) {
-		return ERROR;
+		return FAILURE;
 	}
 
 	do {
@@ -79,11 +82,11 @@ int load_balancer_port_init(char *path, int *sockfd)
 	} while (1);
 
 	if (write_port_to_file(rand_port, path) < 0) {
-		return ERROR;
+		return FAILURE;
 	}
 
 	if (listen(*sockfd, SOCKET_BACKLOG) < 0) {
-		return ERROR;
+		return FAILURE;
 	}
 
 	return 0;
@@ -99,13 +102,95 @@ int sock_await_accept_conn(int sockfd, int conn_cnt, int *connfd)
 		connfd[i] = accept(sockfd, (struct sockaddr *)&connaddr, &addrlen);
 		if (connfd[i] < 0) {
 			dbg("%s\n", strerror(errno));
-			return ERROR;
+			return FAILURE;
 		}
 		dbg("accepted connection!\n");
 	}
 
 	return 0;
 }
+
+bool is_http_msg_in_buff(char *buff, int *http_msg_len)
+{
+	bool ret_val = false;
+	*http_msg_len = -1;
+
+	char *p_empty_line = strstr(buff, HTTP_MSG_END);
+	if (p_empty_line) {
+		*http_msg_len = p_empty_line - buff + HTTP_MSG_END_LEN;
+		ret_val = true;
+	}
+	
+	return ret_val;
+}
+
+int http_msg_recv(int sockfd, char **p_buff)
+{
+	*p_buff = NULL;
+	int buff_len = 0, peek_len = 0;
+	int recv_len, http_msg_len;
+	int ret_val = SUCCESS;
+
+	do {
+		if (peek_len == buff_len) {
+			*p_buff = realloc(*p_buff, buff_len + BUFF_ALLOC_CHUNK + 1);
+			if (!*p_buff) {
+				ret_val = FAILURE;
+				break;
+			}
+			memset(*p_buff, 0, buff_len + BUFF_ALLOC_CHUNK + 1);
+		}
+
+		buff_len += BUFF_ALLOC_CHUNK;
+
+		peek_len = recv(sockfd, *p_buff, buff_len, MSG_PEEK);
+		if (peek_len < 0) {
+			ret_val = FAILURE;
+			break;
+		}
+
+		if (!is_http_msg_in_buff(*p_buff, &http_msg_len)) {
+			continue;
+		}
+		
+		recv_len = recv(sockfd, *p_buff, http_msg_len, 0);
+		if (recv_len != http_msg_len) {
+			ret_val = FAILURE;
+		}
+
+		ret_val = recv_len;
+		break;
+
+	} while (1);
+
+	if (ret_val == FAILURE) {
+		free(*p_buff);
+		p_buff = NULL;
+	}
+
+	return ret_val;
+}
+
+int http_msg_send(int sockfd, char *http_msg_buff)
+{
+	int ret_val = SUCCESS;
+	int tot_sent_len = 0;
+	int msg_len = strlen(http_msg_buff);
+
+	do {
+		int sent_len = send(sockfd, http_msg_buff + tot_sent_len, msg_len - tot_sent_len, 0);
+		if (sent_len < 0) {
+			ret_val = FAILURE;
+			break;
+		}
+
+		tot_sent_len += sent_len;
+
+	} while (tot_sent_len < msg_len);
+
+	return ret_val;
+}
+
 
 int main()
 {
@@ -114,59 +199,72 @@ int main()
 
 	if (load_balancer_port_init(SERVER_PORT_PATH, &env.server_sockfd) < 0) {
 		dbg("%s\n", strerror(errno));
-		return ERROR;
+		return FAILURE;
 	}
 
 	if (load_balancer_port_init(CLIENT_PORT_PATH, &env.client_sockfd) < 0) {
 		dbg("%s\n", strerror(errno));
-		return ERROR;
+		return FAILURE;
 	}
 
 	if (sock_await_accept_conn(env.server_sockfd, MAX_SERVERS, env.servers_conn_sockfd) < 0) {
 		dbg("%s\n", strerror(errno));
-		return ERROR;
+		return FAILURE;
 	}
 
 	while (1) {
-		if (sock_await_accept_conn(env.client_sockfd, MAX_CLIENTS, &env.client_conn_sockfd) < 0) {
+		int client_scokfd;
+		if (sock_await_accept_conn(env.client_sockfd, MAX_CLIENTS, &client_scokfd) < 0) {
 			dbg("%s\n", strerror(errno));
-			return ERROR;
+			return FAILURE;
 		}
 
-		char buff[BUFF_LEN] = {0};
+		char *http_msg_buff = NULL;
 
-		while(1)
-		{
-			int size_recv =  recv(env.client_conn_sockfd , buff , BUFF_LEN , 0);
-			if (size_recv < 0) {
-				dbg("%s\n", strerror(errno));
-				return ERROR;
-			}
-			
-			int size_to_send = size_recv;
-			char *p_start_of_end_of_http_msg = strstr(buff, HTML_MESSAGE_END);
-			if (p_start_of_end_of_http_msg) {
-				char *p_last_http_char = p_start_of_end_of_http_msg + strlen(HTML_MESSAGE_END);
-				size_to_send = p_last_http_char - buff;
-			}
-			
-			while(size_to_send) {
-				int size_sent = send(env.servers_conn_sockfd[env.client_connection_cnt % MAX_SERVERS], buff, size_to_send, 0);
-				if (size_sent < 0) {
-					dbg("%s\n", strerror(errno));
-					return ERROR;
-				} else {
-					size_to_send -= size_sent;
-				}
-			}
-
-			if (p_start_of_end_of_http_msg) {
-				break;
-			}
+		// rx client req
+		if (http_msg_recv(client_scokfd, &http_msg_buff) < 0) {
+			return FAILURE;
 		}
+
+		dbg("cli->serv:\n%s", http_msg_buff);
+
+		// tx req to server
+		int server_connfd = env.servers_conn_sockfd[env.client_connection_cnt % MAX_SERVERS];
+		if (http_msg_send(server_connfd, http_msg_buff) < 0) {
+			return FAILURE;
+		}
+
+		free(http_msg_buff);
+
+		// rx server resp 1
+		if (http_msg_recv(server_connfd, &http_msg_buff) < 0) {
+			return FAILURE;
+		}
+
+		dbg("serv->cli:\n%s", http_msg_buff);
+
+		// tx resp to client
+		if (http_msg_send(client_scokfd, http_msg_buff) < 0) {
+			return FAILURE;
+		}
+
+		free(http_msg_buff);
+
+		// rx server resp 2
+		if (http_msg_recv(server_connfd, &http_msg_buff) < 0) {
+			return FAILURE;
+		}
+
+		dbg("serv->cli:\n%s", http_msg_buff);
+
+		// tx resp to client
+		if (http_msg_send(client_scokfd, http_msg_buff) < 0) {
+			return FAILURE;
+		}
+
+		free(http_msg_buff);
 
 		env.client_connection_cnt++;
-
 		break;
 	}
 
