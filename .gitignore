@@ -1,0 +1,5 @@
+*.o
+.vscode
+ex3_lb
+http_port
+server_port
