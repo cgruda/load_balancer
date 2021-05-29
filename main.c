@@ -1,11 +1,6 @@
-#include <sys/types.h>
-#include <sys/time.h>
-#include <sys/socket.h>
+
 #include <unistd.h>
 #include <netinet/in.h>
-#include <arpa/inet.h>
-#include <errno.h>
-#include <netdb.h>
 #include <stdlib.h>
 #include <stdio.h>
 
@@ -13,38 +8,29 @@
 #include <stdbool.h>
 #include <time.h>
 
-#define SUCCESS			0
-#define FAILURE			-1
-#define dbg			printf
-#define SERVER_PORT_PATH	"server_port"
-#define CLIENT_PORT_PATH	"http_port"
-#define TEMP_CLIENT_PORT	5025
-
 #ifdef RAND_MAX
 #undef RAND_MAX
 #endif
 
-#define RAND_MAX	64000 - RAND_MIN
-#define RAND_MIN	1024
-
-#define MAX_SERVERS			1
-#define MAX_CLIENTS			1
-#define SOCKET_BACKLOG			MAX_SERVERS
-#define CLIENT_SOCKET_MAX_BACKLOG	1
-
+#define SUCCESS			0
+#define FAILURE			-1
+#define SERVER_PORT_PATH	"server_port"
+#define CLIENT_PORT_PATH	"http_port"
+#define RAND_MAX		64000 - RAND_MIN
+#define RAND_MIN		1024
+#define MAX_SERVERS		1
+#define MAX_CLIENTS		1
+#define SOCKET_BACKLOG		MAX_SERVERS
 #define HTTP_MSG_END		"\r\n\r\n"
 #define HTTP_MSG_END_LEN	4
-#define BUFF_LEN 		100
-
-#define BUFF_ALLOC_CHUNK		256
+#define BUFF_ALLOC_CHUNK	256
 
 struct load_balancer_env
 {
 	int server_sockfd;
 	int client_sockfd;
-	int servers_conn_sockfd[MAX_SERVERS];
-	int client_conn_sockfd;
-	int client_connection_cnt;
+	int *server_connfd;
+	int client_conn_cnt;
 };
 
 int write_port_to_file(uint16_t port, char *path)
@@ -58,56 +44,41 @@ int write_port_to_file(uint16_t port, char *path)
 	return 0;
 }
 
-int load_balancer_port_init(char *path, int *sockfd)
+void close_connections(int *connfd, int count)
 {
-	ushort rand_port;
-
-	*sockfd = socket(AF_INET, SOCK_STREAM, 0);
-	if (*sockfd < 0) {
-		return FAILURE;
+	for (int i = 0; i < count; i++) {
+		close(connfd[i]);
 	}
-
-	do {
-		rand_port = rand() + RAND_MIN;
-
-		struct sockaddr_in addr = {0};
-		addr.sin_family = AF_INET;
-		addr.sin_addr.s_addr = htonl(INADDR_ANY);
-		addr.sin_port = htons(rand_port);
-
-		if (!bind(*sockfd, (struct sockaddr *)&addr, sizeof(addr))) {
-			break;
-		}
-
-	} while (1);
-
-	if (write_port_to_file(rand_port, path) < 0) {
-		return FAILURE;
-	}
-
-	if (listen(*sockfd, SOCKET_BACKLOG) < 0) {
-		return FAILURE;
-	}
-
-	return 0;
 }
 
-int sock_await_accept_conn(int sockfd, int conn_cnt, int *connfd)
+int *accept_connections(int sockfd, int connection_cnt)
 {
-	struct sockaddr_in connaddr = {0};
-	socklen_t addrlen = {0};
-	
-	for (int i = 0; i < conn_cnt; i++) {
-		dbg("waiting for connection ... ");
-		connfd[i] = accept(sockfd, (struct sockaddr *)&connaddr, &addrlen);
-		if (connfd[i] < 0) {
-			dbg("%s\n", strerror(errno));
-			return FAILURE;
-		}
-		dbg("accepted connection!\n");
+	int status = SUCCESS;
+	int accepted_connections = 0;
+	struct sockaddr_in addr = {0};
+	socklen_t len = {0};
+
+	int *connfd_arr = calloc(connection_cnt, sizeof(*connfd_arr));
+	if (!connfd_arr) {
+		return NULL;
 	}
 
-	return 0;
+	for (int i = 0; i < connection_cnt; i++) {
+		connfd_arr[i] = accept(sockfd, (struct sockaddr *)&addr, &len);
+		if (connfd_arr[i] < 0) {
+			status = FAILURE;
+			break;
+		}
+		accepted_connections++;
+	}
+
+	if (status == FAILURE) {
+		close_connections(connfd_arr, accepted_connections);
+		free(connfd_arr);
+		connfd_arr = NULL;
+	}
+
+	return connfd_arr;
 }
 
 bool is_http_msg_in_buff(char *buff, int *http_msg_len)
@@ -213,44 +184,132 @@ int tunnel_msg(int srcfd, int destfd)
 
 int http_session(int server_connfd, int client_sockfd)
 {
-		int client_connfd;
+	int ret_val = FAILURE;
 
-		if (sock_await_accept_conn(client_sockfd, MAX_CLIENTS, &client_connfd) < 0) {
-			return FAILURE;
+	int *client_connfd = accept_connections(client_sockfd, 1);
+	if (!client_connfd) {
+		return FAILURE;
+	}
+
+	do {
+		if (tunnel_msg(*client_connfd, server_connfd) < 0) {
+			break;
 		}
 
-		tunnel_msg(client_connfd, server_connfd);
-		tunnel_msg(server_connfd, client_connfd);
-		tunnel_msg(server_connfd, client_connfd);
-		close(client_connfd);
+		if (tunnel_msg(server_connfd, *client_connfd) < 0) {
+			break;
+		}
 
-		return 0;
+		if (tunnel_msg(server_connfd, *client_connfd) < 0) {
+			break;
+		}
+
+		ret_val = SUCCESS;
+
+	} while (0);
+
+	close_connections(client_connfd, 1);
+	free(client_connfd);
+
+	return ret_val;
+}
+
+int socket_bind_listen(char *path)
+{
+	int ret_val = FAILURE;
+	int sockfd;
+	ushort port;
+	struct sockaddr_in addr = {0}; 
+
+	do {
+		sockfd = socket(AF_INET, SOCK_STREAM, 0);
+		if (sockfd < 0) {
+			break;
+		}
+
+		do {
+			port = rand() + RAND_MIN;
+			addr.sin_family = AF_INET;
+			addr.sin_addr.s_addr = htonl(INADDR_ANY);
+			addr.sin_port = htons(port);
+		} while (bind(sockfd, (struct sockaddr *)&addr, sizeof(addr)));
+
+		if (write_port_to_file(port, path) < 0) {
+			break;
+		}
+
+		if (listen(sockfd, SOCKET_BACKLOG) < 0) {
+			break;
+		}
+
+		ret_val = sockfd;
+	} while(0);
+
+	return ret_val;
+}
+
+int load_balancer_init(struct load_balancer_env *env)
+{
+	int ret_val = FAILURE;
+
+	srand(time(0));
+
+	do {
+		env->server_sockfd = socket_bind_listen(SERVER_PORT_PATH);
+		if (env->server_sockfd < 0) {
+			break;
+		}
+
+		env->client_sockfd = socket_bind_listen(CLIENT_PORT_PATH);
+		if (env->client_sockfd < 0) {
+			break;
+		}
+
+		env->server_connfd = accept_connections(env->server_sockfd, MAX_SERVERS);
+		if (!env->server_connfd) {
+			break;
+		}
+
+		ret_val = SUCCESS;
+
+	} while(0);
+
+	if (ret_val == FAILURE) {
+		close(env->server_sockfd);
+		close(env->client_sockfd);
+	}
+
+	return ret_val;
+}
+
+void load_balancer_cleanup(struct load_balancer_env *env)
+{
+	close_connections(env->server_connfd, MAX_SERVERS);
+	free(env->server_connfd);
+	close(env->server_sockfd);
+	close(env->client_sockfd);
 }
 
 int main()
 {
+	int ret_val = EXIT_SUCCESS;
 	struct load_balancer_env env = {0};
-	srand(time(0));
 
-	if (load_balancer_port_init(SERVER_PORT_PATH, &env.server_sockfd) < 0) {
-		return FAILURE;
-	}
-
-	if (load_balancer_port_init(CLIENT_PORT_PATH, &env.client_sockfd) < 0) {
-		return FAILURE;
-	}
-
-	if (sock_await_accept_conn(env.server_sockfd, MAX_SERVERS, env.servers_conn_sockfd) < 0) {
-		return FAILURE;
+	if (load_balancer_init(&env) < 0) {
+		return EXIT_FAILURE;
 	}
 
 	while (1) {
-		int server_connfd = env.servers_conn_sockfd[env.client_connection_cnt % MAX_SERVERS];
-		http_session(server_connfd, env.client_sockfd);
-		env.client_connection_cnt++;
+		int server_idx = env.client_conn_cnt % MAX_SERVERS;
+		int connfd = env.server_connfd[server_idx];
+		if (http_session(connfd, env.client_sockfd) < 0) {
+			ret_val = EXIT_FAILURE;
+			break;
+		}
+		env.client_conn_cnt++;
 	}
 
-	exit(2);
+	load_balancer_cleanup(&env);
 
-	return 0;
+	return ret_val;
 }
