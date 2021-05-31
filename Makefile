@@ -1,15 +1,15 @@
 CC       := gcc
 CFLAGS   := -c -Wall -Wextra
 TARGET   := ex3_lb
-# TESTPATH := ~nimrodav/grep_tests/run_all.sh
+TESTPATH := ~nimrodav/socket_ex/test.sh
 
 all: $(TARGET)
 
 clean:
 	@$(RM) -f *.o $(TARGET)
 
-# test:
-# 	@$(TESTPATH)
+test:
+	@$(TESTPATH)
 
 $(TARGET): main.o http.o connect.o
 	$(CC) -o $(TARGET) $^

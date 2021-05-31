@@ -1,4 +1,4 @@
-#!/usr/bin/python2.7
+#!/usr/bin/python2.7 -tt
 
 import sys
 from socket import *
@@ -61,3 +61,6 @@ port = get_port(port_path)
 sock.connect(('localhost', port))
 while (1):
 	serv_session(sock)
+
+# since the above loop is infinte, 
+# there is no purpose in closing the socket.

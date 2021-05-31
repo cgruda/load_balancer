@@ -31,8 +31,7 @@ int main()
 
 	while (1) {
 		int server_idx = env.session_cnt % MAX_SERVERS;
-		int connfd = env.server_connfd[server_idx];
-		if (http_session(connfd, env.client_sockfd) < 0) {
+		if (http_session(env.server_connfd[server_idx], env.client_sockfd) < 0) {
 			ret_val = -1;
 			break;
 		}
@@ -66,8 +65,8 @@ int load_balancer_init(struct load_balancer_env *env)
 	} while(0);
 
 	if (ret_val < 0) {
-		close(env->server_sockfd);
-		close(env->client_sockfd);
+		gracefull_disconnect(&env->server_sockfd, 1);
+		gracefull_disconnect(&env->client_sockfd, 1);
 	}
 
 	return ret_val;
@@ -75,9 +74,9 @@ int load_balancer_init(struct load_balancer_env *env)
 
 int load_balancer_cleanup(struct load_balancer_env *env)
 {
-	close_connections(env->server_connfd, MAX_SERVERS);
+	gracefull_disconnect(env->server_connfd, MAX_SERVERS);
+	gracefull_disconnect(&env->server_sockfd, 1);
+	gracefull_disconnect(&env->client_sockfd, 1);
 	free(env->server_connfd);
-	close(env->server_sockfd);
-	close(env->client_sockfd);
 	return 0;
 }

@@ -26,46 +26,32 @@ bool is_http_msg_in_buff(char *buff, int *http_msg_len)
 int http_msg_recv(int sockfd, char **p_buff)
 {
 	*p_buff = NULL;
-	int buff_len = 0, peek_len = 0;
-	int recv_len, http_msg_len;
-	int ret_val = 0;
+	int buff_len = 0, peek_len = 0, http_msg_len = -1, ret_val = -1;
 	do {
 		if (peek_len == buff_len) {
 			*p_buff = realloc(*p_buff, buff_len + BUFF_ALLOC_CHUNK + 1);
 			if (!*p_buff) {
-				ret_val = -1;
 				break;
 			}
 			buff_len += BUFF_ALLOC_CHUNK;
 			memset(*p_buff, 0, buff_len + 1);
 		}
-
 		peek_len = recv(sockfd, *p_buff, buff_len, MSG_PEEK);
 		if (peek_len < 0) {
-			ret_val = -1;
 			break;
 		}
+	} while (!is_http_msg_in_buff(*p_buff, &http_msg_len));
 
-		if (!is_http_msg_in_buff(*p_buff, &http_msg_len)) {
-			continue;
-		}
-
+	if (http_msg_len > 0) {
 		memset(*p_buff, 0, buff_len);
-		recv_len = recv(sockfd, *p_buff, http_msg_len, 0);
-		if (recv_len != http_msg_len) {
-			ret_val = -1;
+		if (recv(sockfd, *p_buff, http_msg_len, 0) == http_msg_len) {
+			ret_val = 0;
 		}
-
-		ret_val = recv_len;
-		break;
-
-	} while (1);
+	}
 
 	if (ret_val < 0) {
 		free(*p_buff);
-		p_buff = NULL;
 	}
-
 	return ret_val;
 }
 
@@ -136,7 +122,7 @@ int http_session(int server_connfd, int client_sockfd)
 
 	} while (0);
 
-	close_connections(client_connfd, 1);
+	gracefull_disconnect(client_connfd, 1);
 	free(client_connfd);
 
 	return ret_val;

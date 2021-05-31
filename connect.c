@@ -13,7 +13,7 @@
 
 #define SOCKET_BACKLOG	3
 
-int write_port_to_file(uint16_t port, char *path)
+int write_port_to_file(ushort port, char *path)
 {
 	FILE *fp = fopen(path, "w");
 	if (!fp) {
@@ -46,7 +46,7 @@ int *accept_connections(int sockfd, int connection_cnt)
 	}
 
 	if (status < 0) {
-		close_connections(connfd_arr, accepted_connections);
+		gracefull_disconnect(connfd_arr, accepted_connections);
 		free(connfd_arr);
 		connfd_arr = NULL;
 	}
@@ -76,7 +76,6 @@ int socket_bind_listen(char *path)
 		if (write_port_to_file(port, path) < 0) {
 			break;
 		}
-
 		if (listen(sockfd, SOCKET_BACKLOG) < 0) {
 			break;
 		}
@@ -86,9 +85,14 @@ int socket_bind_listen(char *path)
 	return ret_val;
 }
 
-void close_connections(int *connfd, int count)
+void gracefull_disconnect(int *connfd, int count)
 {
+	char dummy[1];
 	for (int i = 0; i < count; i++) {
+		while (recv(connfd[i], dummy, 1, 0));
+		if (shutdown(connfd[i], SHUT_WR) < 0) {
+			return;
+		}
 		close(connfd[i]);
 	}
 }
