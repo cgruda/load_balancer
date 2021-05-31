@@ -38,8 +38,8 @@ def recv_req(sock):
 def get_resp(addr):
 	global counter
 	if (addr == "/counter"):
-		msg = msg_counter.format(len(str(counter)), counter)
 		counter += 1
+		msg = msg_counter.format(len(str(counter)), counter)
 	else:
 		msg = msg_error
 	return msg
